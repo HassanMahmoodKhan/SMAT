@@ -23,11 +23,6 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
-from polygraphy.backend.trt import Calibrator
-from polygraphy.logger import G_LOGGER
-import onnx
-import pickle
-
 
 class MobileViTv2Track(BaseTracker):
 
@@ -35,19 +30,12 @@ class MobileViTv2Track(BaseTracker):
         super(MobileViTv2Track, self).__init__(params)
         network = build_mobilevitv2_track(params.cfg, training=False)
         network.load_state_dict(torch.load(self.params.checkpoint, map_location='cpu')['net'], strict=True)
-        
-        onnx_checkpoint = self.params.checkpoint.split('.pth')[0] + '.onnx'
-        self.onnx_model = onnx.load(onnx_checkpoint)
-        onnx.checker.check_model(self.onnx_model, True)
-        # Print a human readable representation of the graph
-        # print(onnx.helper.printable_graph(self.onnx_model.graph))
-
         self.cfg = params.cfg
         if self.cfg.TEST.DEVICE == 'cpu':
             self.device = 'cpu'
         else:
             self.device = 'cuda'
-        # print(self.device)
+        print(self.device)
 
         # if self.device == 'cuda':
         #     print('__CUDNN VERSION:', torch.backends.cudnn.version())
@@ -80,31 +68,23 @@ class MobileViTv2Track(BaseTracker):
         self.save_all_boxes = params.save_all_boxes
         self.z_dict1 = {}
 
-        # path where the pytocrh model state dictionary is stored
         weights_path = Path(self.params.checkpoint.split('.tar')[0])
-
-        # Path where calibration data file is located
-        self.calibration_data_path = self.params.checkpoint.split('.pth')[0]+'_calib_data.pkl'
 
         # Paths where ONNX model and TensorRT Engine will be stored.
         self.onnx_file_path = Path(weights_path.with_suffix('.onnx'))
-        self.engine_file_path = Path(weights_path.with_suffix('.tensorrt_int8_.engine'))
+        self.engine_file_path = Path(weights_path.with_suffix('.fp16.engine'))
 
-        # Specify model precision
-        self.precision = np.float32
+        # Specify batch size and model precision
         self.batch_size = 1
+        self.precision = np.float32
 
-        # Create logger. You can adjust the log level if needed i.e, WARNING, INFO, etc.
+        trt.init_libnvinfer_plugins(None,'')
+
+        # # Create logger. You can adjust the log level if needed i.e, WARN, INFO, etc.
         self.TRT_LOGGER = trt.Logger(trt.Logger.ERROR)
- 
-        # Polygraphy Logger Verbosity
-        G_LOGGER.verbosity(G_LOGGER.INFO)
 
-        # Initialize the calibrator i.e., IInt8EntropyCalibrator2
-        self.calibrator = Calibrator(data_loader=self.data_loader(), cache="int8-calib.cache")
-
-        # Perform model conversion from ONNX to equivalent TensorRT Optimized Engine using polgraphy
-        self.engine = self.get_engine(self.onnx_file_path, self.engine_file_path, self.calibrator)
+        # Perform model conversion from ONNX to equivalent TensorRT Optimized Engine
+        self.engine = self.get_engine(self.onnx_file_path, self.engine_file_path)
 
         self.context = self.engine.create_execution_context()
 
@@ -112,58 +92,8 @@ class MobileViTv2Track(BaseTracker):
                         np.random.randn(self.batch_size,3,256,256).astype(self.precision))
 
         self.io_bindings(self.context, self.engine, dummy_inputs)
-
-    def store_inputs(self, model_inputs):
-        """
-        Method that stores the template and search region for each frame of a sequence
-        and writes it to calibration file (pickle format). 
-        Run this once using the standard FP32 inference to collect input samples for 
-        each sequence.  
-        @param model_inputs: The search_region 'x' and the template 'z'
-        """
-
-        # Initialize the list
-        inputs = []
-
-        # Specify the file path
-        file_path = self.calibration_data_path
-
-        new_input = model_inputs
-
-        # Append new data to the list
-        inputs.append(new_input)
-
-        # Write the updated list to the file
-        with open(file_path, 'ab') as file:
-            pickle.dump(inputs, file)
-
-
-    def data_loader(self):
-        """
-        Method that loads input samples from a pickle file and yields/returns the model
-        input dictionary, one input at a time. 
-        """
-        # This variable can be adjusted as per need. Impacts the accuracy of the engine
-        num_of_samples = 20000
-        print(f"Calibrating model using {num_of_samples} samples")
-
-        with open(self.calibration_data_path, 'rb') as file:
-            try:
-                for _ in range(num_of_samples):
-
-                    data = pickle.load(file)
-                    # If data is a list with a single tuple, extract the tuple
-                    if isinstance(data, list) and len(data) == 1 and isinstance(data[0], tuple):
-                        yield {'z': data[0][0],
-                                'x': data[0][1]}
-                    elif isinstance(data, tuple):
-                        yield {'z': data[0],
-                                'x': data[1]}
-            except EOFError:
-                pass 
-
-
-    def get_engine(self, onnx_file_path, engine_file_path, calibrator):
+        
+    def get_engine(self, onnx_file_path, engine_file_path):
         """
           Attempts to load a serialized engine if available, otherwise builds a new 
           TensorRT optimized engine and saves it.
@@ -179,9 +109,9 @@ class MobileViTv2Track(BaseTracker):
                 return runtime.deserialize_cuda_engine(f.read())
         else:
             # Build a new engine if it doesn't exist
-            return self.build_engine(onnx_file_path, engine_file_path, calibrator)
+            return self.build_engine(onnx_file_path, engine_file_path)
 
-    def build_engine(self, onnx_file_path, engine_file_path, calibrator):
+    def build_engine(self, onnx_file_path, engine_file_path):
         """
         Takes an ONNX file and builds a TensorRT engine to run inference with. Serializes the engine
         for storage in a file.
@@ -193,9 +123,7 @@ class MobileViTv2Track(BaseTracker):
             # Configure builder options
             builder.max_batch_size = 1
             config = builder.create_builder_config()
-            config.set_flag(trt.BuilderFlag.FP16) # Enable FP16 layer selection where INT8 is not supported in addition to FP32
-            config.set_flag(trt.BuilderFlag.INT8) # Enable INT8 layer selection
-            config.int8_calibrator = calibrator
+            config.set_flag(trt.BuilderFlag.FP16)
             config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 * 1024 * 1024 * 1024)  # 2GB
 
             # Parse model file
@@ -318,13 +246,6 @@ class MobileViTv2Track(BaseTracker):
         search = self.preprocessor.process(x_patch_arr, x_amask_arr)
                     
         x_dict = search
-
-        # calib_inputs = [
-        #     self.z_dict[0].astype(np.float32),
-        #     x_dict[0].astype(np.float32)
-        #     ]
-        # # Store inputs
-        # self.store_inputs(calib_inputs)
                 
         # Model inputs
         tensorrt_inputs = (self.z_dict[0].astype(self.precision),
@@ -332,6 +253,8 @@ class MobileViTv2Track(BaseTracker):
 
         # Run inference
         out_dict = self.predict(tensorrt_inputs)
+
+        torch.cuda.synchronize()
         
         # Post-process predictions to evaluate tracker performance
         pred_score_map = out_dict[1]
@@ -411,17 +334,6 @@ class MobileViTv2Track(BaseTracker):
                     # "vis_bbox": search_area_with_bbox
                     }
         
-
-    def cleanup(self):
-        self.d_x_input.free()
-        self.d_z_input.free()
-        self.d_cls.free()
-        self.d_reg.free()
-        self.d_size_map.free()
-        self.d_offset_map.free()
-
-        print("Memory buffers clean-up successful!")
-
     def map_box_back(self, pred_box: list, resize_factor: float):
         cx_prev, cy_prev = self.state[0] + 0.5 * self.state[2], self.state[1] + 0.5 * self.state[3]
         cx, cy, w, h = pred_box

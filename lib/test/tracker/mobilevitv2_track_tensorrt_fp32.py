@@ -13,6 +13,7 @@ import cv2
 import os
 import numpy as np
 from pathlib import Path
+import copy
 
 from lib.test.tracker.data_utils_mobilevit import Preprocessor, PreprocessorX_onnx
 from lib.utils.box_ops import clip_box
@@ -84,13 +85,20 @@ class MobileViTv2Track(BaseTracker):
 
         # Perform model conversion from ONNX to equivalent TensorRT Optimized Engine
         self.engine = self.get_engine(self.onnx_file_path, self.engine_file_path)
+
+        self.context = self.engine.create_execution_context()
+
+        dummy_inputs = (np.random.randn(self.batch_size,3,128,128).astype(self.precision),
+                        np.random.randn(self.batch_size,3,256,256).astype(self.precision))
+
+        self.io_bindings(self.context, self.engine, dummy_inputs)
         
     def get_engine(self, onnx_file_path, engine_file_path):
         """
           Attempts to load a serialized engine if available, otherwise builds a new 
           TensorRT optimized engine and saves it.
           @param onnx_file_path: The path where the onnx model is saved.
-          @param engine_file_path: The path where the optimized INT8 tensorRT engine is saved
+          @param engine_file_path: The path where the optimized tensorRT engine is saved
           returns the optimized tensorrt engine
         """     
         if os.path.exists(engine_file_path):
@@ -126,7 +134,7 @@ class MobileViTv2Track(BaseTracker):
                     raise RuntimeError("Failed to parse the ONNX file.")
 
             print("Completed parsing of ONNX file")
-            print("Building an engine from file {}; this may take a while...".format(onnx_file_path))
+            print("Building engine from file {}; this may take a while...".format(onnx_file_path))
 
             # Build the serialized engine and save it
             with trt.Runtime(self.TRT_LOGGER) as runtime:
@@ -138,83 +146,76 @@ class MobileViTv2Track(BaseTracker):
                 f.write(plan)
 
             return engine
+
+    def io_bindings(self, context, engine, inputs):
+        '''
+        Method that allocates memory on the GPU for the inputs and outputs and binds them.
+        @context: The tensorRT context.
+        @engine: The tensorRT engine.
+        @inputs: Dummy inputs used for allocating memory on the GPU.
+        '''
+        
+        # Allocate host and device buffers
+        self.bindings = []
+        for i, binding in enumerate(engine):
+                
+            size = trt.volume(context.get_binding_shape(i)) # Retrieve shape
+            dtype = trt.nptype(engine.get_binding_dtype(binding)) # Retrieve datatype
+            name = engine.get_binding_name(i) # Retrieve name
+                
+            if name == 'z':
+                    self.input_memory_z = cuda.mem_alloc(1*inputs[0].nbytes) # Allocate GPU memory
+                    self.bindings.append(int(self.input_memory_z))
+            elif name == 'x':
+                    self.input_memory_x = cuda.mem_alloc(1*inputs[1].nbytes)
+                    self.bindings.append(int(self.input_memory_x))
+            elif name == 'cls':
+                    self.output_buffer_cls = cuda.pagelocked_empty(size, dtype)
+                    self.output_memory_cls = cuda.mem_alloc(1*self.output_buffer_cls.nbytes)
+                    self.bindings.append(int(self.output_memory_cls))
+            elif name == 'reg':
+                    self.output_buffer_reg = cuda.pagelocked_empty(size, dtype)
+                    self.output_memory_reg = cuda.mem_alloc(1*self.output_buffer_reg.nbytes)
+                    self.bindings.append(int(self.output_memory_reg))
+            elif name == 'size_map':
+                    self.output_buffer_size_map = cuda.pagelocked_empty(size, dtype)
+                    self.output_memory_size_map = cuda.mem_alloc(1*self.output_buffer_size_map.nbytes)
+                    self.bindings.append(int(self.output_memory_size_map))
+            else: # offset_map
+                    self.output_buffer_offset_map = cuda.pagelocked_empty(size, dtype)
+                    self.output_memory_offset_map = cuda.mem_alloc(1*self.output_buffer_offset_map.nbytes)
+                    self.bindings.append(int(self.output_memory_offset_map))
+
+        self.stream = cuda.Stream()
+
             
-    def predict(self, engine, inputs):
+    def predict(self, inputs):
         """
-        Method that allocates buffer/memory on the GPU for the inputs and outputs,
-        asynchronously performs inference, and returns the calculation to the CPU for 
+        Method that asynchronously performs inference, and returns the calculation to the CPU for 
         post-preprocessing.
-        @param engine: The tensorrt engine required for inference
-        @param inputs: The input tuple fed to the model
+        @inputs: The input to the tracker model i.e., z and x.
         returns The output/predeictions; a tuple containing four numpy arrays
         """
-
-        with engine.create_execution_context() as context:
-
-            # Allocate host and device buffers
-            bindings = []
-            for i, binding in enumerate(engine):
-                
-                size = trt.volume(context.get_binding_shape(i)) # Retrieve shape
-                dtype = trt.nptype(engine.get_binding_dtype(binding)) # Retrieve datatype
-                name = engine.get_binding_name(i) # Retrieve name
-                
-                if name == 'z':
-                    input_buffer_z = np.ascontiguousarray(inputs[0])
-                    input_memory_z = cuda.mem_alloc(inputs[0].nbytes) # Allocate GPU memory
-                    bindings.append(int(input_memory_z))
-                elif name == 'x':
-                    input_buffer_x = np.ascontiguousarray(inputs[1])
-                    input_memory_x = cuda.mem_alloc(inputs[1].nbytes)
-                    bindings.append(int(input_memory_x))
-                elif name == 'cls':
-                    output_buffer_cls = cuda.pagelocked_empty(size, dtype)
-                    output_memory_cls = cuda.mem_alloc(output_buffer_cls.nbytes)
-                    bindings.append(int(output_memory_cls))
-                elif name == 'reg':
-                    output_buffer_reg = cuda.pagelocked_empty(size, dtype)
-                    output_memory_reg = cuda.mem_alloc(output_buffer_reg.nbytes)
-                    bindings.append(int(output_memory_reg))
-                elif name == 'size_map':
-                    output_buffer_size_map = cuda.pagelocked_empty(size, dtype)
-                    output_memory_size_map = cuda.mem_alloc(output_buffer_size_map.nbytes)
-                    bindings.append(int(output_memory_size_map))
-                else: # offset_map
-                    output_buffer_offset_map = cuda.pagelocked_empty(size, dtype)
-                    output_memory_offset_map = cuda.mem_alloc(output_buffer_offset_map.nbytes)
-                    bindings.append(int(output_memory_offset_map))
-
-            stream = cuda.Stream()
             
-            # Transfer input data to the GPU.
-            cuda.memcpy_htod_async(input_memory_z, input_buffer_z, stream)
-            cuda.memcpy_htod_async(input_memory_x, input_buffer_x, stream)
+        # Transfer input data to the GPU.
+        cuda.memcpy_htod_async(self.input_memory_z, np.ascontiguousarray(inputs[0]), self.stream)
+        cuda.memcpy_htod_async(self.input_memory_x, np.ascontiguousarray(inputs[1]), self.stream)
             
-            # Run inference
-            context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        # Run inference
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
             
-            # Transfer prediction output from the GPU.
-            cuda.memcpy_dtoh_async(output_buffer_cls, output_memory_cls, stream)
-            cuda.memcpy_dtoh_async(output_buffer_reg, output_memory_reg, stream)
-            cuda.memcpy_dtoh_async(output_buffer_size_map, output_memory_size_map, stream)
-            cuda.memcpy_dtoh_async(output_buffer_offset_map, output_memory_offset_map, stream)
+        # Transfer prediction output from the GPU.
+        cuda.memcpy_dtoh_async(self.output_buffer_cls, self.output_memory_cls, self.stream)
+        cuda.memcpy_dtoh_async(self.output_buffer_reg, self.output_memory_reg, self.stream)
+        cuda.memcpy_dtoh_async(self.output_buffer_size_map, self.output_memory_size_map, self.stream)
+        cuda.memcpy_dtoh_async(self.output_buffer_offset_map, self.output_memory_offset_map, self.stream)
             
-            # Synchronize the stream
-            stream.synchronize()
+        # Synchronize the stream
+        self.stream.synchronize()
 
-            # Clean/Release GPU memory after each inference
-            input_memory_z.free()
-            input_memory_x.free()
-            output_memory_cls.free()
-            output_memory_reg.free()
-            output_memory_size_map.free()
-            output_memory_offset_map.free()
+        # output = (self.output_buffer_cls, self.output_buffer_reg.reshape(1,1,16,16), self.output_buffer_size_map.reshape(1,2,16,16), self.output_buffer_offset_map.reshape(1,2,16,16))
+        output = (copy.deepcopy(self.output_buffer_cls), copy.deepcopy(self.output_buffer_reg.reshape(1,1,16,16)), copy.deepcopy(self.output_buffer_size_map.reshape(1,2,16,16)), copy.deepcopy(self.output_buffer_offset_map.reshape(1,2,16,16)))
 
-            # err = cuda.mem_get_info()
-            # print(f"Available GPU memory: {err[0] / (1024 ** 2)} MB")
-
-            output = (output_buffer_cls, output_buffer_reg.reshape(1,1,16,16), output_buffer_size_map.reshape(1,2,16,16), output_buffer_offset_map.reshape(1,2,16,16))
-        
         return output
 
     def initialize(self, image, info: dict):
@@ -248,9 +249,13 @@ class MobileViTv2Track(BaseTracker):
         # Model inputs
         tensorrt_inputs = (self.z_dict[0].astype(self.precision),
                             x_dict[0].astype(self.precision))
+        # print(tensorrt_inputs[0].shape)
+        # print(tensorrt_inputs[0].dtype)
+        # print(tensorrt_inputs[1].shape)
+        # print(tensorrt_inputs[0].dtype)
 
         # Run inference
-        out_dict = self.predict(self.engine, tensorrt_inputs)
+        out_dict = self.predict(tensorrt_inputs)
 
         torch.cuda.synchronize()
         
