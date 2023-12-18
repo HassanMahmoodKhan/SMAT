@@ -244,8 +244,17 @@ This section outlines how to pull Docker Image(s) for our codebase and then run 
     ```
     module load singularity/default
     ```
-    Once it is loaded, pull the Docker Image(s) from Docker Hub or run the image directly:
-
+    Once it is loaded, and before pulling the Docker Image(s) from Docker Hub, ensure you set the environment variable ``SINGULARITY_CACHEDIR`` to a different location ensuring disk space issues are not encountered. Singularity will cache SIF container images generated from remote sources, and any OCI/docker layers used to create them. The cache is created at `$HOME/.singularity/cache` by default. The location of the cache can be changed by setting the `SINGULARITY_CACHEDIR` environment variable. For instance:
+    
+    ```
+    setenv SINGULARITY_CACHEDIR /speed-scratch/$USER/.singularity
+    ```
+    When building a container, or pulling/running a Singularity container from a Docker/OCI source, a temporary working space is required. The container is constructed in this temporary space before being packaged into a Singularity SIF image. The location for temporary directories defaults to `/tmp`. This location can be overridden by setting the environment variable `SINGULARITY_TMPDIR` to be on a filesystem that has enough space to hold the entire container image, uncompressed, including any temporary files that are created and later removed in the course of the build. Thus, ensure you set the variable to a filesystem like:
+    
+    ```
+    setenv SINGULARITY_TMPDIR /speed-scratch/$USER/.singularity
+    ```
+    Then proceed to pulling the image by running the command:
     ```
     singularity pull docker://hassankhan17/smat:speed
     ```
@@ -256,3 +265,14 @@ This section outlines how to pull Docker Image(s) for our codebase and then run 
     ```
     singularity shell docker://hassankhan17/smat:speed
     ```
+    Once the container is up and running, navigate first to the root directory and then to the working directory i.e., SMAT.
+    ```
+    cd /
+    cd SMAT
+    ```
+    Initialize `bash` or your preferred terminal and activate the  `mobilevit-track` environment before proceeding to execute scripts.
+    ```
+    bash
+    conda activate mobilevit-track
+    ```
+Note: You can run the container as a job by submiting a script with the appropriate commands as specified above.
